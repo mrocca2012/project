@@ -1,0 +1,532 @@
+from machine import Pin, UART, SoftI2C, freq, Timer, reset
+import network
+import ntptime
+import time
+import ubluetooth
+import gc
+import _thread
+import ujson # Importación para manejo de JSON
+
+# --- CONFIGURACIÓN DE ARCHIVOS ---
+CONFIG_FILE = 'config.json'
+LOG_FILE = 'water_log.json'
+
+DEFAULT_CONFIG = {
+    'WIFI_SSID': 'WOWIFI',
+    'WIFI_PASSWORD': 'fliarorewifi',
+    'TIMEZONE_OFFSET_HOURS': -4,
+    'K_FACTOR': 450.0,
+    'FLOW_STOP_TIMEOUT': 5,
+    # El horario se almacena como una lista de listas [[hora, minuto]]
+    'SCHEDULED_TIMES': [[7, 0], [12, 0], [19, 0]] 
+}
+
+# --- PINES Y VARIABLES INICIALES ---
+VALVE_PIN = 23      
+MOTOR_PIN = 22      
+FLOW_SENSOR_PIN = 18 
+
+# Estas variables se sobrescribirán con la configuración cargada
+WIFI_SSID = DEFAULT_CONFIG['WIFI_SSID']
+WIFI_PASSWORD = DEFAULT_CONFIG['WIFI_PASSWORD']
+TIMEZONE_OFFSET_HOURS = DEFAULT_CONFIG['TIMEZONE_OFFSET_HOURS']
+K_FACTOR = DEFAULT_CONFIG['K_FACTOR']
+FLOW_STOP_TIMEOUT = DEFAULT_CONFIG['FLOW_STOP_TIMEOUT']
+SCHEDULED_TIMES = DEFAULT_CONFIG['SCHEDULED_TIMES']
+
+# --- CONFIGURACIÓN DE RED Y TIEMPO ---
+NTP_HOST = '3.south-america.pool.ntp.org'
+
+# --- CONFIGURACIÓN DE BLE ---
+BLE_DEVICE_NAME = "ESP32WC"
+_IRQ_CENTRAL_CONNECT = 1
+_IRQ_CENTRAL_DISCONNECT = 2
+_IRQ_GATTS_WRITE = 3
+# Intervalo de publicidad ajustado a 500ms para una detección rápida.
+_ADV_INTERVAL_MS = 500 
+
+# UUIDs en formato STRING (probado para evitar EINVAL)
+_SVC_UUID = ubluetooth.UUID("499B0001-4321-ABCD-1234-AABBCCDD0001") 
+_CHAR_CONTROL_UUID = ubluetooth.UUID("499B0002-4321-ABCD-1234-AABBCCDD0002")
+_CHAR_CONTROL = (
+    _CHAR_CONTROL_UUID,
+    ubluetooth.FLAG_WRITE | ubluetooth.FLAG_NOTIFY,
+)
+_CHAR_STATUS_UUID = ubluetooth.UUID("499B0003-4321-ABCD-1234-AABBCCDD0003")
+_CHAR_STATUS = (
+    _CHAR_STATUS_UUID,
+    ubluetooth.FLAG_READ | ubluetooth.FLAG_NOTIFY,
+)
+_SERVICES = (
+    (_SVC_UUID, (_CHAR_CONTROL, _CHAR_STATUS)),
+)
+
+# --- VARIABLES GLOBALES DE ESTADO ---
+wlan = None
+ble = None
+conn_handle = None
+control_handle = None
+status_handle = None
+
+valve_on = False
+motor_on = False
+scheduled_run_active = False 
+
+flow_pulses = 0           
+pulse_count_sec = 0       
+flow_liters_total = 0.0   # Persistente: se carga/guarda
+flow_stop_timer_start = 0 
+
+# Inicialización de Pines
+try:
+    valve_pin = Pin(VALVE_PIN, Pin.OUT)
+    motor_pin = Pin(MOTOR_PIN, Pin.OUT)
+    flow_pin = Pin(FLOW_SENSOR_PIN, Pin.IN, Pin.PULL_DOWN)
+    valve_pin.value(0) 
+    motor_pin.value(0) 
+except Exception as e:
+    print(f"Error inicializando pines: {e}. ¿Pines correctos?")
+
+# Bloqueo para proteger el acceso a variables compartidas
+lock = _thread.allocate_lock() 
+
+# --- FUNCIONES DE PERSISTENCIA (CONFIG y LOG) ---
+
+def load_config():
+    """Carga la configuración desde config.json o crea el archivo por defecto."""
+    global WIFI_SSID, WIFI_PASSWORD, TIMEZONE_OFFSET_HOURS, K_FACTOR, FLOW_STOP_TIMEOUT, SCHEDULED_TIMES
+    
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = ujson.load(f)
+            print("✅ Configuración cargada de archivo.")
+    except (OSError, ValueError):
+        print("⚠️ No se encontró o falló la lectura de config.json. Usando valores por defecto.")
+        config = DEFAULT_CONFIG
+        save_config(config) # Guardar la configuración por defecto
+        
+    # Aplicar configuración
+    WIFI_SSID = config.get('WIFI_SSID', DEFAULT_CONFIG['WIFI_SSID'])
+    WIFI_PASSWORD = config.get('WIFI_PASSWORD', DEFAULT_CONFIG['WIFI_PASSWORD'])
+    TIMEZONE_OFFSET_HOURS = config.get('TIMEZONE_OFFSET_HOURS', DEFAULT_CONFIG['TIMEZONE_OFFSET_HOURS'])
+    K_FACTOR = config.get('K_FACTOR', DEFAULT_CONFIG['K_FACTOR'])
+    FLOW_STOP_TIMEOUT = config.get('FLOW_STOP_TIMEOUT', DEFAULT_CONFIG['FLOW_STOP_TIMEOUT'])
+    SCHEDULED_TIMES = config.get('SCHEDULED_TIMES', DEFAULT_CONFIG['SCHEDULED_TIMES'])
+    
+def save_config(config_data):
+    """Guarda el diccionario de configuración en config.json."""
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            ujson.dump(config_data, f)
+        print("✅ Configuración guardada.")
+        return True
+    except Exception as e:
+        print(f"❌ Error al guardar config.json: {e}")
+        return False
+
+def load_water_log():
+    """Carga el volumen total de agua desde water_log.json."""
+    global flow_liters_total
+    try:
+        with open(LOG_FILE, 'r') as f:
+            log_data = ujson.load(f)
+            flow_liters_total = log_data.get('total_liters', 0.0)
+            print(f"✅ Log de agua cargado. Total acumulado: {flow_liters_total:.2f} L")
+    except (OSError, ValueError):
+        print("⚠️ No se encontró o falló la lectura de water_log.json. Iniciando contador en 0.0 L")
+        save_water_log(0.0)
+
+def save_water_log(total_liters):
+    """Guarda el volumen total de agua en water_log.json."""
+    try:
+        log_data = {'total_liters': total_liters, 'timestamp': time.time()}
+        with open(LOG_FILE, 'w') as f:
+            ujson.dump(log_data, f)
+        # print(f"Log de agua actualizado: {total_liters:.2f} L")
+        return True
+    except Exception as e:
+        print(f"❌ Error al guardar water_log.json: {e}")
+        return False
+
+# --- FUNCIONES DE MANEJO DE FLUJO (ISR) ---
+def flow_pulse_handler(pin):
+    """
+    Rutina de Servicio de Interrupción (ISR) para contar pulsos del sensor de flujo.
+    Esta función debe ser lo más rápida posible.
+    """
+    global flow_pulses, pulse_count_sec
+    with lock:
+        flow_pulses += 1
+        pulse_count_sec += 1
+
+flow_pin.irq(trigger=Pin.IRQ_RISING, handler=flow_pulse_handler)
+
+def calculate_flow(seconds_passed=1):
+    """
+    Calcula el flujo instantáneo (L/min) y actualiza el volumen total.
+    """
+    global flow_liters_total, pulse_count_sec, flow_pulses, K_FACTOR
+    
+    with lock:
+        current_pulses = pulse_count_sec
+        pulse_count_sec = 0 
+    
+    liters_added = current_pulses / K_FACTOR
+    flow_liters_total += liters_added
+    
+    if seconds_passed > 0 and current_pulses > 0:
+        flow_rate_lpm = (current_pulses / seconds_passed) * (60.0 / K_FACTOR)
+    else:
+        flow_rate_lpm = 0.0
+
+    return flow_rate_lpm, liters_added
+
+
+# --- FUNCIONES DE SINCRONIZACIÓN ---
+def sync_time():
+    """Sincroniza la hora con NTP y ajusta la zona horaria."""
+    global TIMEZONE_OFFSET_HOURS
+    
+    # Intenta obtener el objeto WLAN. Si no está conectado, salta.
+    wlan = network.WLAN(network.STA_IF)
+    if not wlan.isconnected():
+        print("⚠️ Wi-Fi no conectado. No se puede sincronizar NTP.")
+        return False
+        
+    try:
+        print("Sincronizando hora con NTP...")
+        ntptime.host = NTP_HOST
+        ntptime.settime()
+        
+        local_seconds = time.time() + TIMEZONE_OFFSET_HOURS * 3600
+        time.localtime(local_seconds)
+        print(f"✅ Hora sincronizada y ajustada a UTC{TIMEZONE_OFFSET_HOURS}.")
+        print(f"✅ Hora actual: ",time.localtime(local_seconds))
+        return True
+    except Exception as e:
+        print(f"❌ Error al sincronizar NTP: {e}")
+        return False
+
+def get_current_time():
+    """Retorna la hora y minuto y segundo actuales locales."""
+    local_seconds = time.time() + TIMEZONE_OFFSET_HOURS * 3600
+    t = time.localtime(local_seconds)
+    return t[3], t[4], t[5]
+
+# --- FUNCIONES DE CONTROL DE ACTUADORES (CON INTERBLOQUEO DE SEGURIDAD) ---
+
+def set_motor(state):
+    """
+    Enciende (1) o Apaga (0) el motor y actualiza el estado global.
+    IMP: Bloquea si la válvula está encendida.
+    """
+    global motor_on, valve_on
+    
+    if state and valve_on:
+        print("⚠️ SEGURIDAD: Motor NO activado. La válvula está encendida (Loop Evitado).")
+        return
+        
+    state = 1 if state else 0
+    motor_pin.value(state)
+    motor_on = (state == 1)
+    print(f"MOTOR {'ON' if motor_on else 'OFF'}")
+
+
+def set_valve(state):
+    """
+    Enciende (1) o Apaga (0) la válvula y actualiza el estado global.
+    
+    MEJORA DE SEGURIDAD: Si se solicita encender la válvula y el motor está encendido,
+    el motor se apaga primero para evitar interbloqueos antes de continuar con la válvula.
+    """
+    global valve_on, motor_on
+    
+    if state:
+        # Lógica de seguridad activa: Si el motor está ON y queremos encender la válvula, apagamos el motor primero.
+        if motor_on:
+            print("🚨 SEGURIDAD ACTIVA: Motor encendido detectado al encender Válvula. Apagando motor primero.")
+            set_motor(False) # Llamada recursiva (motor off)
+            # set_motor(False) ya se encargará de configurar motor_on = False
+        
+    # Aplicar el estado deseado a la válvula
+    state = 1 if state else 0
+    valve_pin.value(state)
+    valve_on = (state == 1)
+    print(f"VALVE {'ON' if valve_on else 'OFF'}")
+
+
+# --- IMPLEMENTACIÓN DEL SERVIDOR BLE ---
+
+def ble_irq(event, data):
+    """Manejador de interrupciones BLE."""
+    global conn_handle
+    
+    if event == _IRQ_CENTRAL_CONNECT:
+        conn_handle, _, _ = data
+        print(f"BLE: Dispositivo conectado (Handle: {conn_handle})")
+        
+    elif event == _IRQ_CENTRAL_DISCONNECT:
+        print("BLE: Dispositivo desconectado.")
+        conn_handle = None
+        ble_advertise()
+        
+    elif event == _IRQ_GATTS_WRITE:
+        conn_handle, value_handle = data
+        if conn_handle is not None:
+            command_bytes = ble.gatts_read(value_handle)
+            process_ble_command(command_bytes)
+
+def ble_advertise():
+    """
+    Inicia la publicidad BLE.
+    Construye el payload de publicidad para asegurar que el nombre (BLE_DEVICE_NAME)
+    se anuncie correctamente.
+    """
+    
+    # 1. Bandera (Flags): 0x02 Length, 0x01 AD Type (Flags), 0x06 Data (General Discoverable)
+    adv_flags = b'\x02\x01\x06'
+    
+    # 2. Nombre del dispositivo (Complete Local Name - 0x09)
+    name_bytes = BLE_DEVICE_NAME.encode('utf-8')
+    name_len = len(name_bytes)
+    
+    # El primer byte es la longitud total del campo (nombre + tipo 0x09)
+    adv_name = bytes([name_len + 1, 0x09]) + name_bytes
+    
+    adv_data = adv_flags + adv_name
+    
+    # En Micropython, ble.gap_advertise() detiene automáticamente cualquier publicidad anterior.
+    ble.gap_advertise(_ADV_INTERVAL_MS, adv_data=adv_data)
+    print(f"BLE: Publicitando como '{BLE_DEVICE_NAME}' a un intervalo de {_ADV_INTERVAL_MS}ms")
+
+def init_ble():
+    """Configura e inicia el servicio BLE."""
+    global ble, control_handle, status_handle
+    ble = ubluetooth.BLE()
+    ble.active(True)
+    ble.irq(ble_irq)
+    # 1. Registrar servicios (esto debe ser lo primero antes de publicitar)
+    ((control_handle, status_handle),) = ble.gatts_register_services(_SERVICES)
+    # 2. Empezar a publicitar
+    ble_advertise()
+    return control_handle, status_handle
+
+def process_schedule_command(schedule_string):
+    """Procesa el comando SCHEDULE SET HH:MM,HH:MM,..."""
+    global SCHEDULED_TIMES
+    
+    new_times = []
+    
+    # Intenta parsear la lista de horarios separados por coma
+    try:
+        parts = [p.strip() for p in schedule_string.split(',')]
+        if not parts or not parts[0]:
+            return "ERR: Horario vacío"
+        
+        for part in parts:
+            h, m = map(int, part.split(':'))
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                new_times.append([h, m])
+            else:
+                return f"ERR: Hora inválida {part}"
+                
+    except Exception:
+        return "ERR: Formato de horario incorrecto (HH:MM,HH:MM)"
+
+    # Actualizar la configuración global y guardar en el archivo
+    if new_times:
+        SCHEDULED_TIMES = new_times
+        
+        # Cargar configuración actual para modificar solo el horario
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = ujson.load(f)
+        except:
+            config = DEFAULT_CONFIG.copy()
+
+        config['SCHEDULED_TIMES'] = new_times
+        if save_config(config):
+            print(f"✅ Nuevo horario guardado: {SCHEDULED_TIMES}")
+            return "OK: Horario actualizado"
+        else:
+            return "ERR: Fallo al guardar config"
+    return "ERR: Horario no procesado"
+
+def process_ble_command(command_bytes):
+    """Procesa comandos recibidos por BLE."""
+    global scheduled_run_active
+    
+    try:
+        command = command_bytes.decode().strip().upper()
+        print(f"BLE CMD: {command}")
+        parts = command.split(' ', 2) # Dividir máximo 2 veces para capturar el argumento completo
+        
+        response = "OK"
+        
+        if not parts:
+            response = "ERR: No command"
+        
+        elif parts[0] == "VALVE" and len(parts) == 2:
+            if parts[1] == "ON":
+                set_valve(True)
+                scheduled_run_active = False 
+            elif parts[1] == "OFF":
+                set_valve(False)
+            else:
+                response = "ERR: Comando VALVE inválido"
+                
+        elif parts[0] == "MOTOR" and len(parts) == 2:
+            if parts[1] == "ON":
+                set_motor(True)
+            elif parts[1] == "OFF":
+                set_motor(False)
+            else:
+                response = "ERR: Comando MOTOR inválido"
+        
+        elif parts[0] == "SCHEDULE" and parts[1] == "SET" and len(parts) == 3:
+            # Nuevo manejo del horario
+            response = process_schedule_command(parts[2])
+                
+        elif parts[0] == "STATUS":
+            # Si se solicita el estado, se notifica inmediatamente y no se envía "OK" al control handle.
+            notify_status()
+            return 
+            
+        elif parts[0] == "RESET_FLOW":
+            global flow_liters_total
+            flow_liters_total = 0.0
+            save_water_log(flow_liters_total)
+            response = "OK: FLOW_TOTAL reset to 0.0"
+
+        else:
+            response = "ERR: Comando desconocido"
+            
+    except Exception as e:
+        response = f"ERR: Exception {e}"
+
+    # Envío de respuesta al comando recibido
+    if conn_handle and control_handle:
+        try:
+            ble.gatts_write(control_handle, response.encode('utf8'))
+        except:
+            # Si falla la escritura (ej. el cliente no tiene el handle habilitado para escritura/notificación)
+            pass 
+
+def notify_status():
+    """Notifica el estado actual (actuadores y flujo) al cliente BLE."""
+    global flow_liters_total, status_handle, conn_handle
+    
+    if not conn_handle or not status_handle:
+        return # No notificar si no hay conexión o handle
+
+    time_tuple = get_current_time()
+    current_time_str = f"{time_tuple[0]:02d}:{time_tuple[1]:02d}:{time_tuple[2]:02d}"
+    
+    status_msg = (
+        f"STATUS:"
+        f"TIME={current_time_str};"
+        f"VALVE={1 if valve_on else 0};"
+        f"MOTOR={1 if motor_on else 0};"
+        f"FLOW_TOTAL={flow_liters_total:.2f}L;"
+        f"SCHEDULE={1 if scheduled_run_active else 0}"
+    )
+    
+    try:
+        # Usamos gatts_notify para enviar la actualización de estado
+        ble.gatts_notify(conn_handle, status_handle, status_msg.encode('utf8'))
+    except Exception as e:
+        # Esto ocurre si el cliente no habilitó las notificaciones (descriptor CCCD)
+        # print(f"Error al notificar BLE: {e}")
+        pass
+
+# --- FUNCIÓN PRINCIPAL DE LÓGICA DE CONTROL ---
+
+def main_control_loop():
+    """
+    Bucle principal que maneja la lógica de tiempo, programación y auto-apagado.
+    """
+    global scheduled_run_active, flow_stop_timer_start, FLOW_STOP_TIMEOUT
+    
+    last_second = -1
+    last_save_time = time.time()
+    
+    # Sincronizamos la hora al inicio del bucle. El boot.py ya se ha asegurado de la conexión Wi-Fi.
+    sync_time()
+    
+    while True:
+        try:
+            current_hour, current_minute, current_second = get_current_time()
+            current_timestamp = time.time()
+            
+            # Lógica que se ejecuta cada segundo
+            if current_second != last_second:
+                last_second = current_second
+                
+                # 1. Calular Flujo y Acumulación
+                flow_rate_lpm, liters_added = calculate_flow(seconds_passed=1)
+                
+                # 2. Lógica de Persistencia del Log de Agua (cada 60 segundos)
+                if current_timestamp - last_save_time >= 60:
+                    save_water_log(flow_liters_total)
+                    last_save_time = current_timestamp
+                
+                # 3. Lógica de Activación Programada
+                if not valve_on: 
+                    # Comprobamos la hora y minuto actuales en la lista de horarios
+                    if [current_hour, current_minute] in SCHEDULED_TIMES and current_second == 0:
+                        set_valve(True)
+                        if valve_on:
+                            scheduled_run_active = True
+                            print("🤖 Evento programado activado.")
+                        
+                # 4. Lógica de Auto-Apagado (Shutoff)
+                if valve_on and scheduled_run_active:
+                    if flow_rate_lpm < 0.01: # Si el flujo es virtualmente cero
+                        if flow_stop_timer_start == 0:
+                            flow_stop_timer_start = current_timestamp
+                            print("⚠️ Flujo detectado como CERO. Iniciando conteo de apagado.")
+                        
+                        elif (current_timestamp - flow_stop_timer_start) >= FLOW_STOP_TIMEOUT:
+                            set_valve(False)
+                            scheduled_run_active = False
+                            flow_stop_timer_start = 0
+                            print("🛑 Apagado automático: Flujo cero por más de 5 segundos.")
+                            
+                    else:
+                        if flow_stop_timer_start != 0:
+                            flow_stop_timer_start = 0
+                            print("✅ Flujo reestablecido. Reiniciando monitoreo de apagado.")
+
+                # 5. Notificar estado por BLE (cada 5 segundos)
+                if conn_handle and current_second % 5 == 0:
+                    notify_status()
+                    
+            time.sleep(0.01) 
+            
+        except Exception as e:
+            print(f"Error en el bucle de control: {e}")
+            time.sleep(5)
+            gc.collect()
+
+
+# --- FUNCIÓN DE INICIO ---
+
+def start_system():
+    # 0. Cargar Configuración y Log
+    load_config()
+    load_water_log()
+    
+    print("--- Inicializando Sistema de Control de Agua ---")
+    
+    # El Wi-Fi y la hora se gestionan al inicio por boot.py y se sincroniza en el main loop.
+    
+    # 1. Configuración BLE
+    global control_handle, status_handle
+    control_handle, status_handle = init_ble()
+    
+    # 2. Iniciar bucle de control
+    print("--- Entrando al bucle principal ---")
+    main_control_loop()
+
+if __name__ == "__main__":
+    start_system()
