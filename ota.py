@@ -1,7 +1,7 @@
 # Modulo OTA Updater para MicroPython
-# Basado en micropython-ota-updater (simplificado y modificado para un solo archivo)
+# Usa conexion HTTPS (segura) con la dependencia 'ussl'.
 import usocket
-import ssl as ussl
+import ssl as ussl # <-- Necesario para HTTPS. Asumimos 'import ssl as ussl' esta aplicado si falla.
 import ujson
 import machine
 import os
@@ -9,11 +9,13 @@ import time
 
 class OTAUpdater:
     def __init__(self, github_url, main_file='main.py'):
+        # Extrae el nombre de host (ej: raw.githubusercontent.com)
         self.http_host = github_url.replace('https://', '').replace('http://', '').split('/')[0]
         self.github_url = github_url
         self.main_file = main_file
         self.version_url = github_url + 'version.json'
         self.files_url = github_url + 'files.json'
+        self.http_port = 443 # Puerto por defecto para HTTPS
         
         # Paths locales
         self.current_version_file = 'version.json'
@@ -22,49 +24,59 @@ class OTAUpdater:
         self.update_folder = 'update/'
 
     def _http_get(self, url):
-        """Realiza una solicitud HTTP GET y retorna el contenido."""
+        """Realiza una solicitud HTTP GET (a traves de SSL) y retorna el contenido."""
         url_path = url.replace(f'https://{self.http_host}', '')
-        addr = usocket.getaddrinfo(self.http_host, 443)[0][-1]
+        addr = usocket.getaddrinfo(self.http_host, self.http_port)[0][-1]
         s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
-        s.connect(addr)
         
-        # Envolver el socket para SSL
-        s = ussl.wrap_socket(s, server_hostname=self.http_host)
-        
-        # Solicitud HTTP/1.0
-        s.send(f"GET {url_path} HTTP/1.0\r\nHost: {self.http_host}\r\n\r\n".encode())
+        try:
+            s.connect(addr)
+            # Envolver el socket para SSL
+            s = ussl.wrap_socket(s, server_hostname=self.http_host)
+            # Solicitud HTTP/1.0
+            request = f"GET {url_path} HTTP/1.0\r\nHost: {self.http_host}\r\nUser-Agent: MicroPython\r\n\r\n".encode()
+            s.send(request)
 
-        # Leer encabezados
-        data = s.recv(1024)
-        response = data.decode()
-        
-        # Encontrar el inicio del cuerpo (despues de la primera linea vacia)
-        content_start = response.find('\r\n\r\n')
-        if content_start == -1:
-            s.close()
-            raise Exception("No se encontró el cuerpo HTTP")
-            
-        content = response[content_start + 4:]
-
-        # Leer el resto del cuerpo
-        while True:
+            # --- Leer la Respuesta ---
+            # Leemos los primeros 1024 bytes para verificar encabezados
             data = s.recv(1024)
-            if data:
-                content += data.decode()
-            else:
-                break
+            response = data.decode('utf-8', 'ignore')
 
-        s.close()
+            # 1. Verificar el codigo de estado HTTP (Debe ser 200 OK)
+            if not response.startswith('HTTP/1.0 200 OK') and not response.startswith('HTTP/1.1 200 OK'):
+                # Si no es 200 OK, lanzamos un error claro indicando el codigo de estado
+                first_line = response.split('\r\n')[0]
+                raise Exception(f"HTTP Error: {first_line}")
+
+            # 2. Encontrar el inicio del cuerpo (despues de la primera linea vacia)
+            content_start = response.find('\r\n\r\n')
+            if content_start == -1:
+                raise Exception("Respuesta incompleta (no se encontró el cuerpo)")
+                
+            content = response[content_start + 4:]
+
+            # 3. Leer el resto del cuerpo
+            while True:
+                data = s.recv(1024)
+                if data:
+                    content += data.decode('utf-8', 'ignore')
+                else:
+                    break
+        finally:
+            s.close()
+            
         return content
 
     def _get_latest_version(self):
         """Descarga y parsea el archivo version.json remoto."""
         try:
             content = self._http_get(self.version_url)
+            # Aquí es donde el error de sintaxis JSON ocurriría si el contenido fuera HTML/error
             remote_version = ujson.loads(content)['version']
             return remote_version
         except Exception as e:
-            print(f"Error al obtener version remota: {e}")
+            # Ahora este error capturará tanto los errores HTTP (404) como los de JSON.
+            print(f"❌ Error al obtener version remota (Verifique URL/JSON): {e}")
             return '0.0'
 
     def _get_current_version(self):
@@ -87,7 +99,7 @@ class OTAUpdater:
         try:
             content = self._http_get(url)
             # Asegurar que la carpeta update exista
-            if not 'update/' in os.listdir():
+            if 'update/' not in os.listdir():
                 os.mkdir('update')
                 
             with open(temp_filepath, 'w') as f:
@@ -178,9 +190,10 @@ class OTAUpdater:
     def clean_update_folder(self):
         """Limpia la carpeta 'update'."""
         try:
-            for file in os.listdir(self.update_folder):
-                os.remove(self.update_folder + file)
-            os.rmdir(self.update_folder)
-            print("Carpeta 'update' limpia.")
+            if 'update/' in os.listdir():
+                for file in os.listdir(self.update_folder):
+                    os.remove(self.update_folder + file)
+                os.rmdir(self.update_folder)
+                print("Carpeta 'update' limpia.")
         except:
             pass

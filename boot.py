@@ -3,37 +3,61 @@ import network
 import time
 import gc
 import os
+from machine import freq
+
+freq(80000000)
 
 # --- Configuracion de OTA ---
 # Reemplaza 'tu_usuario' y 'tu_repositorio' con los datos de tu proyecto
-GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/esp32water/main/" 
+GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/project/master/"
+#GITHUB_URL = "https://raw.github.com/mrocca2012/esp32water/tree/master"
 
 def connect_to_wifi():
-    """Conecta el ESP32 a la red Wi-Fi para la actualizacion OTA."""
+    """
+    Conecta el ESP32 a la red Wi-Fi probando múltiples credenciales.
+    Es ideal para usar en boot.py para actualizaciones OTA.
+    """
     
-    # ⚠️ IMPORTANTE: Estas credenciales deben estar grabadas previamente 
-    # en el archivo config.json o harcodeadas aqui para la OTA inicial.
-    # Usaremos valores fijos por simplicidad del boot.
-    SSID = 'WOWIFI'
-    PASSWORD = 'fliarorewifi'
+    # Lista de tuplas: (SSID, PASSWORD) en orden de preferencia
+    WIFI_CREDENTIALS = [
+        ('Nordik', 'nordik2019'),
+        ('WOWIFI', 'fliarorewifi')
+    ]
     
     print("Iniciando conexión Wi-Fi para OTA...")
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    if not wlan.isconnected():
-        wlan.connect(SSID, PASSWORD)
+    
+    if wlan.isconnected():
+        print(f"✅ Wi-Fi ya conectado. IP: {wlan.ifconfig()[0]}")
+        return True
+
+    for ssid, password in WIFI_CREDENTIALS:
+        print(f"📡 Intentando conectar a: {ssid}...")
+        
+        wlan.connect(ssid, password)
+        
+        # Tiempo de espera (timeout) por red
         timeout = 15
         while not wlan.isconnected() and timeout > 0:
             time.sleep(1)
             timeout -= 1
         
         if wlan.isconnected():
-            print(f"✅ Wi-Fi conectado. IP: {wlan.ifconfig()[0]}")
+            print(f"✅ Wi-Fi conectado a '{ssid}'. IP: {wlan.ifconfig()[0]}")
             return True
         else:
-            print("❌ Error de conexión Wi-Fi.")
-            return False
-    return True
+            print(f"❌ Falló la conexión a '{ssid}'. Tiempo agotado.")
+            # Desconectar y/o desactivar brevemente para limpiar el estado antes de la próxima
+            wlan.disconnect() 
+            time.sleep(1) # Esperar un segundo antes de probar la siguiente red
+
+    print("❌ Error de conexión Wi-Fi. No se pudo conectar a ninguna red.")
+    return False
+
+# Ejemplo de uso (opcional, si estás probando):
+# if __name__ == '__main__':
+#     connect_to_wifi()
 
 def check_for_updates():
     """Verifica y ejecuta la actualizacion OTA."""

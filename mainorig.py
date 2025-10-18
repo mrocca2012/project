@@ -2,11 +2,12 @@ from machine import Pin, UART, SoftI2C, freq, Timer, reset
 import network
 import ntptime
 import time
-import ubluetooth
+import bluetooth
 import gc
 import _thread
 import ujson
-from micropython import const # Necesario si defines tus propias constantes, aunque usaremos las de ubluetooth
+from micropython import const # Necesario si defines tus propias constantes, aunque usaremos las de bluetooth
+
 # ----------------------------------------------------------------------
 # --- CONSTANTES DE SISTEMA Y CONFIGURACIÓN ---
 # ----------------------------------------------------------------------
@@ -40,15 +41,15 @@ _ADV_INTERVAL_MS = 500
 
 # UUIDs
 # 1. Servicio Principal (Battery Service: 0x180F - ELEGIDO COMO EJEMPLO)
-_SVC_UUID = ubluetooth.UUID(0x180C) 
+_SVC_UUID = bluetooth.UUID("a326aeb0-9090-4525-9f4c-ffc0b50bb20f") 
 # 2. Característica de Control (Date Time: 0x2A88 - Comando IN/Respuesta OUT)
-_CHAR_CONTROL_UUID = ubluetooth.UUID(0x2a88)
+_CHAR_CONTROL_UUID = bluetooth.UUID("d6fde959-b0ba-4565-b737-63aaeb0d5671")
 # 3. Característica de Estado (Battery Level: 0x2A19 - Estado OUT/Notificación)
-_CHAR_STATUS_UUID = ubluetooth.UUID(0x2a19)
+_CHAR_STATUS_UUID = bluetooth.UUID("ae03927e-6f70-4bf0-a148-636042445f59")
 
 # Definición de características (UUID, Flags)
-_CHAR_CONTROL = (_CHAR_CONTROL_UUID, ubluetooth.FLAG_WRITE | ubluetooth.FLAG_READ)
-_CHAR_STATUS = (_CHAR_STATUS_UUID, ubluetooth.FLAG_NOTIFY | ubluetooth.FLAG_READ)
+_CHAR_CONTROL = (_CHAR_CONTROL_UUID, bluetooth.FLAG_WRITE | bluetooth.FLAG_READ)
+_CHAR_STATUS = (_CHAR_STATUS_UUID, bluetooth.FLAG_NOTIFY | bluetooth.FLAG_READ)
 
 # Definición de Servicios GATTS: 
 # Debe ser una tupla de servicios: ( (Servicio1), (Servicio2), ... )
@@ -168,15 +169,16 @@ class FlowSensor:
         return flow_rate_lpm, liters_added
 
 # ----------------------------------------------------------------------
-# --- 3. CONTROLADOR ubluetooth (BLE) ---
+# --- 3. CONTROLADOR BLUETOOTH (BLE) ---
 # ----------------------------------------------------------------------
 
 class BLEController:
     """Gestiona la inicialización, publicidad y manejo de eventos BLE."""
+
     def __init__(self, device_name, command_processor_callback):
         self.device_name = device_name
         self.command_processor = command_processor_callback
-        self.ble = ubluetooth.BLE()
+        self.ble = bluetooth.BLE()
         self.conn_handle = None
         self.control_handle = None
         self.status_handle = None
@@ -190,8 +192,10 @@ class BLEController:
         global _SERVICES 
         self.ble.active(True)
         self.ble.irq(self._ble_irq)
+        
         # Intenta registrar los servicios
         handles = self.ble.gatts_register_services(_SERVICES)
+        
         # === INICIO DE LA VERIFICACIÓN DE ERROR ===
         # Si 'handles' es un entero (código de error), el registro falló.
         if isinstance(handles, int):
@@ -199,6 +203,7 @@ class BLEController:
             # Se puede añadir una llamada a reset() o raise Exception
             raise RuntimeError("BLE GATTS registration failed.")
         # === FIN DE LA VERIFICACIÓN DE ERROR ===
+        
         # Extracción de handles (solo si el registro fue exitoso)
         # handles[0] es la tupla de handles del primer servicio registrado.
         self.control_handle = handles[0][0]
@@ -263,15 +268,12 @@ class BLEController:
         return False
      """
     # Modificación en la clase BLEController
-    def notif_status(self, status_msg):
+    def notify_status(self, status_msg):
         """Notifica el estado actual al cliente BLE a través del handle de status."""
-        #for conn_handle in self._connections:
-        #if self.conn_handle and self.status_handle:
-        if self.conn_handle != None :
+        if self.conn_handle and self.status_handle:
             try:
                 # Usar gatts_notify requiere que el cliente haya escrito 0x0001 en el CCCD.
                 self.ble.gatts_notify(self.conn_handle, self.status_handle, status_msg.encode('utf8'))
-                #self.ble.gatts_notify(self.conn_handle, self.status_handle, status_msg.encode())
                 # print("DEBUG: Status notified successfully.") # Opcional: para confirmación
                 return True
             except Exception as e:
@@ -475,16 +477,15 @@ class SystemController:
         current_time_str = f"{current_hour:02d}:{current_minute:02d}:{current_second:02d}"
 
         status_msg = (
-            f"S:"
-            f"{current_hour:02d};"
-            f"{current_minute:02d};"
-            f"{1 if self.valve_on else 0};"
-            f"{1 if self.motor_on else 0};"
-            f"{flow_liters_total:.2f};"
-            f"{1 if self.scheduled_run_active else 0}"
+            f"STATUS:"
+            f"TIME={current_time_str};"
+            f"VALVE={1 if self.valve_on else 0};"
+            f"MOTOR={1 if self.motor_on else 0};"
+            f"FLOW_TOTAL={flow_liters_total:.2f}L;"
+            f"SCHEDULE={1 if self.scheduled_run_active else 0}"
         )
         print(status_msg)
-        self.ble_controller.notif_status(status_msg)
+        self.ble_controller.notify_status(status_msg)
 
     # ----------------------------------------------------------------------
     # --- Bucle Principal de Control ---
@@ -502,6 +503,7 @@ class SystemController:
         # ======================================
 
         print("--- Entrando al bucle principal de control ---")
+
         while True:
             try:
                 # Obtener la hora local (con offset de zona horaria)
@@ -555,6 +557,7 @@ class SystemController:
                 if self.ble_controller.conn_handle is not None:
                     # Comprueba si han pasado 5 segundos desde la última notificación
                     if current_timestamp - last_notify_time >= 5:
+                        print("-")
                         self.notify_status()
                         last_notify_time = current_timestamp # Reiniciar el contador
                         
@@ -563,7 +566,7 @@ class SystemController:
 
             except Exception as e:
                 print(f"❌ Error CRÍTICO en el bucle de control: {e}")
-                time.sleep(1)
+                time.sleep(5)
                 gc.collect()
 # ----------------------------------------------------------------------
 # --- PUNTO DE ENTRADA ---
