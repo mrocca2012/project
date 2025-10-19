@@ -4,13 +4,13 @@ import time
 import gc
 import os
 from machine import freq
+file_version = 1.1
 
 freq(80000000)
 
+
 # --- Configuracion de OTA ---
-# Reemplaza 'tu_usuario' y 'tu_repositorio' con los datos de tu proyecto
 GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/project/master/"
-#GITHUB_URL = "https://raw.github.com/mrocca2012/esp32water/tree/master"
 
 def connect_to_wifi():
     """
@@ -20,8 +20,8 @@ def connect_to_wifi():
     
     # Lista de tuplas: (SSID, PASSWORD) en orden de preferencia
     WIFI_CREDENTIALS = [
-        ('Nordik', 'nordik2019'),
-        ('WOWIFI', 'fliarorewifi')
+        ('WOWIFI', 'fliarorewifi'),
+        ('Nordik', 'nordik2019')
     ]
     
     print("Iniciando conexión Wi-Fi para OTA...")
@@ -61,11 +61,9 @@ def connect_to_wifi():
 
 def check_for_updates():
     """Verifica y ejecuta la actualizacion OTA."""
-    
     # Intentamos conectar para la OTA
     if not connect_to_wifi():
-        return False
-        
+        return False     
     try:
         import ota
         updater = ota.OTAUpdater(GITHUB_URL, main_file='main.py')

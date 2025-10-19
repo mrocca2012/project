@@ -6,7 +6,7 @@ import ubluetooth
 import gc
 import _thread
 import ujson
-from micropython import const # Necesario si defines tus propias constantes, aunque usaremos las de ubluetooth
+file_version = 1.1
 # ----------------------------------------------------------------------
 # --- CONSTANTES DE SISTEMA Y CONFIGURACIÓN ---
 # ----------------------------------------------------------------------

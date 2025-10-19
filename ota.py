@@ -6,6 +6,7 @@ import ujson
 import machine
 import os
 import time
+file_version = 1.1
 
 class OTAUpdater:
     def __init__(self, github_url, main_file='main.py'):
@@ -16,12 +17,11 @@ class OTAUpdater:
         self.version_url = github_url + 'version.json'
         self.files_url = github_url + 'files.json'
         self.http_port = 443 # Puerto por defecto para HTTPS
-        
         # Paths locales
         self.current_version_file = 'version.json'
         self.temporary_version_file = 'tmp_version.json'
-        self.backup_folder = 'backup/'
-        self.update_folder = 'update/'
+        self.backup_folder = 'backup'
+        self.update_folder = 'update'
 
     def _http_get(self, url):
         """Realiza una solicitud HTTP GET (a traves de SSL) y retorna el contenido."""
@@ -93,13 +93,12 @@ class OTAUpdater:
         """Descarga un archivo al directorio de actualizacion."""
         url = self.github_url + filename
         temp_filepath = self.update_folder + filename
-        
         print(f"Descargando {filename} a {temp_filepath}...")
         
         try:
             content = self._http_get(url)
             # Asegurar que la carpeta update exista
-            if 'update/' not in os.listdir():
+            if 'update' not in os.listdir():
                 os.mkdir('update')
                 
             with open(temp_filepath, 'w') as f:
@@ -123,12 +122,11 @@ class OTAUpdater:
 
     def download_updates(self):
         """Descarga todos los archivos listados en files.json remotos."""
-        
         # Eliminar carpeta de actualizacion anterior si existe
         try:
-            if 'update/' in os.listdir():
-                for file in os.listdir('update/'):
-                    os.remove('update/' + file)
+            if 'update' in os.listdir():
+                for file in os.listdir('update'):
+                    os.remove('update' + file)
                 os.rmdir('update')
         except:
             pass
@@ -137,9 +135,11 @@ class OTAUpdater:
             # 1. Obtener la lista de archivos a actualizar
             files_content = self._http_get(self.files_url)
             files_to_download = ujson.loads(files_content)['files']
-            
             # 2. Crear carpeta de actualizacion
-            os.mkdir(self.update_folder)
+            try:
+                os.mkdir(self.update_folder)
+            except:
+                print("error ")
 
             # 3. Descargar todos los archivos listados
             for filename in files_to_download:
@@ -190,7 +190,7 @@ class OTAUpdater:
     def clean_update_folder(self):
         """Limpia la carpeta 'update'."""
         try:
-            if 'update/' in os.listdir():
+            if 'update' in os.listdir():
                 for file in os.listdir(self.update_folder):
                     os.remove(self.update_folder + file)
                 os.rmdir(self.update_folder)
