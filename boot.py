@@ -4,10 +4,9 @@ import time
 import gc
 import os
 from machine import freq
-file_version = 1.1
+file_version = 1.2
 
 freq(80000000)
-
 
 # --- Configuracion de OTA ---
 GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/project/master/"

@@ -36,12 +36,10 @@ class OTAUpdater:
             # Solicitud HTTP/1.0
             request = f"GET {url_path} HTTP/1.0\r\nHost: {self.http_host}\r\nUser-Agent: MicroPython\r\n\r\n".encode()
             s.send(request)
-
             # --- Leer la Respuesta ---
             # Leemos los primeros 1024 bytes para verificar encabezados
             data = s.recv(1024)
             response = data.decode('utf-8', 'ignore')
-
             # 1. Verificar el codigo de estado HTTP (Debe ser 200 OK)
             if not response.startswith('HTTP/1.0 200 OK') and not response.startswith('HTTP/1.1 200 OK'):
                 # Si no es 200 OK, lanzamos un error claro indicando el codigo de estado

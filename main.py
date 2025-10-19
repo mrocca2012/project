@@ -6,7 +6,8 @@ import ubluetooth
 import gc
 import _thread
 import ujson
-file_version = 1.1
+
+file_version = 1.3 # Versión actualizada
 # ----------------------------------------------------------------------
 # --- CONSTANTES DE SISTEMA Y CONFIGURACIÓN ---
 # ----------------------------------------------------------------------
@@ -19,7 +20,9 @@ DEFAULT_CONFIG = {
     'TIMEZONE_OFFSET_HOURS': -4,
     'K_FACTOR': 450.0,
     'FLOW_STOP_TIMEOUT': 5, # Segundos
-    'SCHEDULED_TIMES': [[7, 0], [12, 0], [19, 0]], # [[hora, minuto]]
+    'SCHEDULED_WEEKEND':[[8, 00], [12, 00], [19, 00]],
+    'SCHEDULED_WEEKDAY':[[7, 00], [12, 00], [19, 00]],
+    #separador
     'NTP_HOST': '3.south-america.pool.ntp.org'
 }
 
@@ -39,19 +42,15 @@ _IRQ_GATTS_WRITE = 3 # Evento de escritura a una característica (incluye CCCD)
 _ADV_INTERVAL_MS = 500
 
 # UUIDs
-# 1. Servicio Principal (Battery Service: 0x180F - ELEGIDO COMO EJEMPLO)
-_SVC_UUID = ubluetooth.UUID(0x180C) 
-# 2. Característica de Control (Date Time: 0x2A88 - Comando IN/Respuesta OUT)
-_CHAR_CONTROL_UUID = ubluetooth.UUID(0x2a88)
-# 3. Característica de Estado (Battery Level: 0x2A19 - Estado OUT/Notificación)
-_CHAR_STATUS_UUID = ubluetooth.UUID(0x2a19)
+_SVC_UUID = ubluetooth.UUID(0x180C) # Servicio Principal
+_CHAR_CONTROL_UUID = ubluetooth.UUID(0x2a88) # Característica de Control
+_CHAR_STATUS_UUID = ubluetooth.UUID(0x2a19) # Característica de Estado
 
 # Definición de características (UUID, Flags)
 _CHAR_CONTROL = (_CHAR_CONTROL_UUID, ubluetooth.FLAG_WRITE | ubluetooth.FLAG_READ)
 _CHAR_STATUS = (_CHAR_STATUS_UUID, ubluetooth.FLAG_NOTIFY | ubluetooth.FLAG_READ)
 
 # Definición de Servicios GATTS: 
-# Debe ser una tupla de servicios: ( (Servicio1), (Servicio2), ... )
 _SERVICES = (
     ( # Este paréntesis crea el "Servicio 1"
         _SVC_UUID,
@@ -122,7 +121,7 @@ class ConfigManager:
             return False
 
 # ----------------------------------------------------------------------
-# --- 2. SENSOR DE FLUJO ---
+# --- 2. SENSOR DE FLUJO (Sin cambios) ---
 # ----------------------------------------------------------------------
 
 class FlowSensor:
@@ -141,9 +140,6 @@ class FlowSensor:
 
     def _irq_handler(self, pin):
         """Rutina de Servicio de Interrupción (ISR). DEBE ser lo más simple posible."""
-        # Proteger la variable compartida con el lock (necesario en micropython multithreading)
-        # Nota: En un simple bucle principal sin hilo secundario, el lock puede no ser estrictamente
-        # necesario para el ISR, pero es una buena práctica de seguridad.
         if self.lock.acquire(0): # Intenta adquirir el bloqueo sin esperar
             self.pulses_total += 1
             self.lock.release()
@@ -168,7 +164,7 @@ class FlowSensor:
         return flow_rate_lpm, liters_added
 
 # ----------------------------------------------------------------------
-# --- 3. CONTROLADOR ubluetooth (BLE) ---
+# --- 3. CONTROLADOR ubluetooth (BLE) (Sin cambios funcionales) ---
 # ----------------------------------------------------------------------
 
 class BLEController:
@@ -183,26 +179,18 @@ class BLEController:
 
         self._init_ble()
 
-    # En la clase BLEController:
-
     def _init_ble(self):
         """Configura e inicia el servicio BLE."""
         global _SERVICES 
         self.ble.active(True)
         self.ble.irq(self._ble_irq)
-        # Intenta registrar los servicios
         handles = self.ble.gatts_register_services(_SERVICES)
-        # === INICIO DE LA VERIFICACIÓN DE ERROR ===
-        # Si 'handles' es un entero (código de error), el registro falló.
+        
         if isinstance(handles, int):
             print(f"❌ Error FATAL al registrar servicios GATTS. Código: {handles}")
-            # Se puede añadir una llamada a reset() o raise Exception
             raise RuntimeError("BLE GATTS registration failed.")
-        # === FIN DE LA VERIFICACIÓN DE ERROR ===
-        # Extracción de handles (solo si el registro fue exitoso)
-        # handles[0] es la tupla de handles del primer servicio registrado.
+            
         self.control_handle = handles[0][0]
-        # handles[0][1] es la tupla (handle_valor, handle_cccd) para la segunda característica.
         self.status_handle = handles[0][1] 
         
         print(f"BLE Handles: Control={self.control_handle}, Status={self.status_handle}")
@@ -224,68 +212,40 @@ class BLEController:
         elif event == _IRQ_GATTS_WRITE:
             conn_handle, value_handle = data
             
-            # Procesar comandos si la escritura es en la característica de Control
             if value_handle == self.control_handle:
                 command_bytes = self.ble.gatts_read(value_handle)
                 response = self.command_processor(command_bytes)
                 
                 if response and self.conn_handle:
                     try:
-                        # Escribir la respuesta de vuelta (opcional, pero útil para ACK)
                         self.ble.gatts_write(self.control_handle, response.encode('utf8'))
                     except Exception as e:
                         pass
             
-            # La escritura en el CCCD (para habilitar notificaciones) es gestionada 
-            # internamente por la pila BLE de MicroPython/NimBLE.
 
     def advertise(self):
         """Inicia la publicidad BLE."""
-        # Crear Advertising Data: Flags (0x06) + Nombre del dispositivo (0x09)
         adv_flags = b'\x02\x01\x06' 
         name_bytes = self.device_name.encode('utf-8')
-        # Tipo 0x09: Complete Local Name. El primer byte es la longitud total (longitud_nombre + 1 para el tipo)
         adv_name = bytes([len(name_bytes) + 1, 0x09]) + name_bytes
         adv_data = adv_flags + adv_name
 
         self.ble.gap_advertise(_ADV_INTERVAL_MS, adv_data=adv_data)
-    """
-    def notify_status(self, status_msg):
-        # Notifica el estado actual al cliente BLE a través del handle de status.
-        if self.conn_handle and self.status_handle:
-            try:
-                # La notificación solo se envía si el cliente ha escrito 0x0001 en el CCCD
-                self.ble.gatts_notify(self.conn_handle, self.status_handle, status_msg.encode('utf8'))
-                return True
-            except Exception as e:
-                # print(f"Error al notificar BLE: {e}") 
-                return False
-        return False
-     """
-    # Modificación en la clase BLEController
+    
     def notif_status(self, status_msg):
         """Notifica el estado actual al cliente BLE a través del handle de status."""
-        #for conn_handle in self._connections:
-        #if self.conn_handle and self.status_handle:
         if self.conn_handle != None :
             try:
-                # Usar gatts_notify requiere que el cliente haya escrito 0x0001 en el CCCD.
                 self.ble.gatts_notify(self.conn_handle, self.status_handle, status_msg.encode('utf8'))
-                #self.ble.gatts_notify(self.conn_handle, self.status_handle, status_msg.encode())
-                # print("DEBUG: Status notified successfully.") # Opcional: para confirmación
                 return True
             except Exception as e:
-                # Si falla, a menudo es porque el cliente no habilitó la notificación (CCCD)
                 print(f"❌ Error al notificar BLE: {e}. Cliente probablemente no habilitó CCCD.")
                 return False
         else:
-            # Esto se manejará en el main_loop, pero es un buen chequeo
-            # print("DEBUG: Notification failed, no active connection.")
             return False
-        return False
 
 # ----------------------------------------------------------------------
-# --- 4. CONTROLADOR PRINCIPAL DEL SISTEMA ---
+# --- 4. CONTROLADOR PRINCIPAL DEL SISTEMA (MODIFICADO) ---
 # ----------------------------------------------------------------------
 
 class SystemController:
@@ -302,7 +262,6 @@ class SystemController:
         self.config = self.config_manager.config
         self.k_factor = self.config['K_FACTOR']
         self.timezone_offset_hours = self.config['TIMEZONE_OFFSET_HOURS']
-        self.scheduled_times = self.config['SCHEDULED_TIMES']
         self.flow_stop_timeout = self.config['FLOW_STOP_TIMEOUT']
 
         # 1. Inicializar Pines (Actuadores apagados por defecto)
@@ -365,13 +324,16 @@ class SystemController:
             return False
 
     def get_current_time(self):
-        """Retorna la hora, minuto y segundo actuales locales (hh, mm, ss)."""
-        # Calcular el tiempo local aplicando el offset
+        """
+        Retorna la hora, minuto, segundo y el día de la semana actuales locales.
+        Día de la semana (wd): Lunes=0, Domingo=6.
+        """
         local_seconds = time.time() + self.timezone_offset_hours * 3600
         t = time.localtime(local_seconds)
-        return t[3], t[4], t[5] # Hora, minuto, segundo
+        # t[6] es el día de la semana (0=Lunes a 6=Domingo)
+        return t[3], t[4], t[5], t[6] # Hora, minuto, segundo, día_semana
 
-    # --- Métodos de Actuadores ---
+    # --- Métodos de Actuadores (Sin cambios) ---
 
     def set_motor(self, state):
         """Enciende (True) o apaga (False) el motor."""
@@ -400,36 +362,35 @@ class SystemController:
         if not self.valve_on:
             self.scheduled_run_active = False
 
-    # --- Métodos de Comandos BLE ---
+    # --- Lógica de Programación (NUEVO MÉTODO) ---
 
-    def _process_schedule_command(self, schedule_string):
-        """Procesa el comando SCHEDULE SET HH:MM,HH:MM,... y actualiza la configuración."""
-        new_times = []
-        try:
-            parts = [p.strip() for p in schedule_string.split(',')]
-            if not parts or not parts[0]:
-                return "ERR: Horario vacío"
+    def check_scheduled_run(self, current_hour, current_minute, current_second, day_of_week):
+        """
+        Verifica si la hora actual coincide con un horario programado para el día de la semana.
+        Retorna True si la válvula debe encenderse.
+        """
+        if self.valve_on or current_second != 0:
+            return False # No hacer nada si ya está encendida o no es el segundo 0
+        # Días de semana son Lunes (0) a Viernes (4)
+        is_weekday = 0 <= day_of_week <= 4
+        is_weekend = 5 <= day_of_week <= 6 
+        current_time = [current_hour, current_minute]
 
-            for part in parts:
-                h, m = map(int, part.split(':'))
-                if 0 <= h <= 23 and 0 <= m <= 59:
-                    new_times.append([h, m])
-                else:
-                    return f"ERR: Hora inválida {part}"
+        if is_weekday:
+            current_time in self.config['SCHEDULED_WEEKDAY']
+            target_schedule = self.config['SCHEDULED_WEEKDAY']
+            print("encontrado semana")
+        elif is_weekend:
+            current_time in self.config['SCHEDULED_WEEKEND']
+            target_schedule = self.config['SCHEDULED_WEEKEND']
+        # Comprueba si la hora actual coincide con algún horario para el día
+        if current_time in target_schedule:
+            print(f"🤖 Evento programado ({'SEMANA' if is_weekday else 'FIN DE SEMANA'}) activado: {current_hour:02d}:{current_minute:02d}.")
+            return True
+            
+        return False
 
-        except Exception:
-            return "ERR: Formato de horario incorrecto (HH:MM,HH:MM)"
-
-        if new_times:
-            self.scheduled_times = new_times
-            if self.config_manager.save_config({'SCHEDULED_TIMES': new_times}):
-                print(f"✅ Nuevo horario guardado: {self.scheduled_times}")
-                return "OK: Horario actualizado"
-            else:
-                return "ERR: Fallo al guardar config"
-        return "ERR: Horario no procesado"
-
-
+    # --- Métodos de Comandos BLE (Simplificados y Adaptados) ---
     def process_ble_command(self, command_bytes):
         """Procesa comandos recibidos por BLE (callback del BLEController)."""
         try:
@@ -447,14 +408,14 @@ class SystemController:
             elif parts[0] == "MOTOR" and len(parts) == 2:
                 self.set_motor(parts[1] == "ON")
             
-            elif parts[0] == "SCHEDULE" and parts[1] == "SET" and len(parts) == 3:
-                response = self._process_schedule_command(parts[2])
+            # El comando SCHEDULE SET ya no es necesario o funcional con la nueva lógica de horarios fijos.
+            elif parts[0] == "SCHEDULE":
+                response = f"INFO: Horario fijo: Semana={SCHEDULED_WEEKDAY_TIMES}, FinSemana={SCHEDULED_WEEKEND_TIMES}"
             
             elif parts[0] == "STATUS":
-                # Notificar el estado y no enviar respuesta de control.
                 self.notify_status()
                 return None
-            
+                
             elif parts[0] == "RESET_FLOW":
                 self.config_manager.save_log(0.0)
                 response = "OK: FLOW_TOTAL reset to 0.0"
@@ -471,47 +432,44 @@ class SystemController:
     def notify_status(self):
         """Prepara y envía la notificación de estado a través de BLE."""
         flow_liters_total = self.config_manager.flow_liters_total
-        current_hour, current_minute, current_second = self.get_current_time()
-        current_time_str = f"{current_hour:02d}:{current_minute:02d}:{current_second:02d}"
-
+        current_hour, current_minute, current_second, current_day = self.get_current_time() # Incluye día
+        
+        # Generar una cadena compacta de estado
         status_msg = (
             f"S:"
-            f"{current_hour:02d};"
-            f"{current_minute:02d};"
-            f"{1 if self.valve_on else 0};"
-            f"{1 if self.motor_on else 0};"
-            f"{flow_liters_total:.2f};"
-            f"{1 if self.scheduled_run_active else 0}"
+            f"{current_hour:02d};" # 0. Hora
+            f"{current_minute:02d};" # 1. Minuto
+            f"{1 if self.valve_on else 0};" # 2. Válvula
+            f"{1 if self.motor_on else 0};" # 3. Motor
+            f"{flow_liters_total:.2f};" # 4. Litros Totales
+            f"{1 if self.scheduled_run_active else 0};" # 5. Ejecución Programada Activa
+            f"{current_day}" # 6. Día de la semana (0-6)
         )
         print(status_msg)
         self.ble_controller.notif_status(status_msg)
 
     # ----------------------------------------------------------------------
-    # --- Bucle Principal de Control ---
+    # --- Bucle Principal de Control (MODIFICADO) ---
     # ----------------------------------------------------------------------
-# Modificación en la clase SystemController.main_loop
 
     def main_loop(self):
         """Bucle principal que maneja la lógica de tiempo, programación y auto-apagado."""
-        global current_second
         last_second = -1
         last_save_time = time.time()
-        
-        # === AÑADIR NUEVA VARIABLE DE TIEMPO ===
         last_notify_time = time.time() 
-        # ======================================
-
+        
         print("--- Entrando al bucle principal de control ---")
         while True:
             try:
-                # Obtener la hora local (con offset de zona horaria)
-                current_hour, current_minute, current_second = self.get_current_time()
+                # Obtener la hora local COMPLETA
+                current_hour, current_minute, current_second, day_of_week = self.get_current_time()
                 current_timestamp = time.time()
+                
                 # Lógica que se ejecuta cada segundo
                 if current_second != last_second:
                     last_second = current_second
-                
-                # 1. Calular Flujo y Acumulación
+                    
+                    # 1. Calular Flujo y Acumulación
                     pulses = self.flow_sensor.read_and_reset_pulses()
                     flow_rate_lpm, liters_added = self.flow_sensor.calculate_flow(pulses, seconds_passed=1)
                     self.config_manager.flow_liters_total += liters_added
@@ -520,19 +478,14 @@ class SystemController:
                     if current_timestamp - last_save_time >= 60:
                         self.config_manager.save_log(self.config_manager.flow_liters_total)
                         last_save_time = current_timestamp
-                        #print(".")
                         
-                    # 3. Lógica de Activación Programada (solo si la válvula está OFF)
-                    if not self.valve_on:
-                        current_time = [current_hour, current_minute]
-                        # Comprueba si la hora actual coincide con alguna programada (y es el segundo 0)
-                        if current_time in self.scheduled_times and current_second == 0:
-                            self.set_valve(True)
-                            if self.valve_on:
-                                self.scheduled_run_active = True
-                                self.flow_stop_timer_start = 0 
-                                print("🤖 Evento programado activado.")
-                                
+                    # 3. Lógica de Activación Programada (USA EL NUEVO MÉTODO)
+                    if self.check_scheduled_run(current_hour, current_minute, current_second, day_of_week):
+                        self.set_valve(True)
+                        if self.valve_on:
+                            self.scheduled_run_active = True
+                            self.flow_stop_timer_start = 0 
+                            
                     # 4. Lógica de Auto-Apagado por Falta de Flujo (Shutoff)
                     if self.valve_on and self.scheduled_run_active:
                         if flow_rate_lpm < 0.01: # Si el flujo es virtualmente cero
@@ -551,7 +504,7 @@ class SystemController:
                                 self.flow_stop_timer_start = 0
                                 print("✅ Flujo reestablecido. Reiniciando monitoreo de apagado.")
                 
-                # --- Lógica de Notificación de Estado (Fuera del chequeo de 'last_second') ---
+                # --- Lógica de Notificación de Estado ---
                 if self.ble_controller.conn_handle is not None:
                     # Comprueba si han pasado 5 segundos desde la última notificación
                     if current_timestamp - last_notify_time >= 5:
@@ -566,7 +519,7 @@ class SystemController:
                 time.sleep(1)
                 gc.collect()
 # ----------------------------------------------------------------------
-# --- PUNTO DE ENTRADA ---
+# --- PUNTO DE ENTRADA (Sin cambios) ---
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     try:
@@ -574,5 +527,4 @@ if __name__ == "__main__":
         controller.main_loop()
     except Exception as e:
         print(f"FATAL: Error al iniciar el sistema: {e}")
-        # Intento de reinicio después de un error fatal
         reset()
