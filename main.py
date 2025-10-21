@@ -7,7 +7,7 @@ import gc
 import _thread
 import ujson
 
-file_version = 1.3 # Versión actualizada
+file_version = 1.5 # Versión actualizada
 # ----------------------------------------------------------------------
 # --- CONSTANTES DE SISTEMA Y CONFIGURACIÓN ---
 # ----------------------------------------------------------------------
@@ -20,8 +20,8 @@ DEFAULT_CONFIG = {
     'TIMEZONE_OFFSET_HOURS': -4,
     'K_FACTOR': 450.0,
     'FLOW_STOP_TIMEOUT': 5, # Segundos
-    'SCHEDULED_WEEKEND':[[8, 00], [12, 00], [19, 00]],
-    'SCHEDULED_WEEKDAY':[[7, 00], [12, 00], [19, 00]],
+    'SCHEDULED_WEEKEND':[[8, 0], [12, 0], [19, 0]],
+    'SCHEDULED_WEEKDAY':[[7, 0], [12, 0], [19, 0]],
     #separador
     'NTP_HOST': '3.south-america.pool.ntp.org'
 }
@@ -45,10 +45,12 @@ _ADV_INTERVAL_MS = 500
 _SVC_UUID = ubluetooth.UUID(0x180C) # Servicio Principal
 _CHAR_CONTROL_UUID = ubluetooth.UUID(0x2a88) # Característica de Control
 _CHAR_STATUS_UUID = ubluetooth.UUID(0x2a19) # Característica de Estado
+_CHAR_PARAM1_UUID = ubluetooth.UUID(0x2a02) # Característica de Estado
 
 # Definición de características (UUID, Flags)
 _CHAR_CONTROL = (_CHAR_CONTROL_UUID, ubluetooth.FLAG_WRITE | ubluetooth.FLAG_READ)
 _CHAR_STATUS = (_CHAR_STATUS_UUID, ubluetooth.FLAG_NOTIFY | ubluetooth.FLAG_READ)
+_CHAR_PARAM1 = (_CHAR_PARAM1_UUID, ubluetooth.FLAG_READ)
 
 # Definición de Servicios GATTS: 
 _SERVICES = (
@@ -57,6 +59,7 @@ _SERVICES = (
         ( # Esta tupla contiene las características del Servicio 1
             _CHAR_CONTROL,
             _CHAR_STATUS,
+            _CHAR_PARAM1,
         )
     ), # Cierre del "Servicio 1"
 )
@@ -176,6 +179,7 @@ class BLEController:
         self.conn_handle = None
         self.control_handle = None
         self.status_handle = None
+        self.param1_handle = None
 
         self._init_ble()
 
@@ -191,9 +195,10 @@ class BLEController:
             raise RuntimeError("BLE GATTS registration failed.")
             
         self.control_handle = handles[0][0]
-        self.status_handle = handles[0][1] 
+        self.status_handle = handles[0][1]
+        self.param1_handle = handles[0][2]
         
-        print(f"BLE Handles: Control={self.control_handle}, Status={self.status_handle}")
+        print(f"BLE Handles: Control={self.control_handle}, Status={self.status_handle}, Param1={self.param1_handle}")
 
         self.advertise()
         print("✅ Servicio BLE inicializado y publicitando.")
@@ -243,6 +248,16 @@ class BLEController:
                 return False
         else:
             return False
+        
+    def write_param1(self, params_msg):
+        data_bytes = params_msg.encode('utf8')
+        try:
+            self.ble.gatts_write(self.param1_handle, data_bytes)
+            return True
+        except Exception as e:
+            print(f"❌ Error al escribir param BLE: {e}.")
+            return False
+        
 
 # ----------------------------------------------------------------------
 # --- 4. CONTROLADOR PRINCIPAL DEL SISTEMA (MODIFICADO) ---
@@ -263,6 +278,10 @@ class SystemController:
         self.k_factor = self.config['K_FACTOR']
         self.timezone_offset_hours = self.config['TIMEZONE_OFFSET_HOURS']
         self.flow_stop_timeout = self.config['FLOW_STOP_TIMEOUT']
+        
+        # Cargar horarios activos
+        self.weekday_schedule = self.config['SCHEDULED_WEEKDAY']
+        self.weekend_schedule = self.config['SCHEDULED_WEEKEND']
 
         # 1. Inicializar Pines (Actuadores apagados por defecto)
         self.valve_pin = Pin(VALVE_PIN, Pin.OUT, value=0)
@@ -371,32 +390,33 @@ class SystemController:
         """
         if self.valve_on or current_second != 0:
             return False # No hacer nada si ya está encendida o no es el segundo 0
+        
         # Días de semana son Lunes (0) a Viernes (4)
         is_weekday = 0 <= day_of_week <= 4
         is_weekend = 5 <= day_of_week <= 6 
         current_time = [current_hour, current_minute]
+        
+        target_schedule = None
 
         if is_weekday:
-            current_time in self.config['SCHEDULED_WEEKDAY']
-            target_schedule = self.config['SCHEDULED_WEEKDAY']
-            print("encontrado semana")
+            target_schedule = self.weekday_schedule
         elif is_weekend:
-            current_time in self.config['SCHEDULED_WEEKEND']
-            target_schedule = self.config['SCHEDULED_WEEKEND']
+            target_schedule = self.weekend_schedule
+        
         # Comprueba si la hora actual coincide con algún horario para el día
-        if current_time in target_schedule:
+        if target_schedule and current_time in target_schedule:
             print(f"🤖 Evento programado ({'SEMANA' if is_weekday else 'FIN DE SEMANA'}) activado: {current_hour:02d}:{current_minute:02d}.")
             return True
             
         return False
 
-    # --- Métodos de Comandos BLE (Simplificados y Adaptados) ---
+    # --- Métodos de Comandos BLE (MODIFICADO) ---
     def process_ble_command(self, command_bytes):
         """Procesa comandos recibidos por BLE (callback del BLEController)."""
         try:
             command = command_bytes.decode().strip().upper()
             print(f"BLE CMD: {command}")
-            parts = command.split(' ', 2)
+            parts = command.split(' ', 2) # Dividir el comando en hasta 3 partes
             response = "OK"
 
             if not parts or not parts[0]:
@@ -408,9 +428,40 @@ class SystemController:
             elif parts[0] == "MOTOR" and len(parts) == 2:
                 self.set_motor(parts[1] == "ON")
             
-            # El comando SCHEDULE SET ya no es necesario o funcional con la nueva lógica de horarios fijos.
-            elif parts[0] == "SCHEDULE":
-                response = f"INFO: Horario fijo: Semana={SCHEDULED_WEEKDAY_TIMES}, FinSemana={SCHEDULED_WEEKEND_TIMES}"
+            # NUEVO: SET_SCHEDULE <WEEKDAY|WEEKEND> <JSON_ARRAY_HORARIOS>
+            elif parts[0] == "SET_SCHEDULE" and len(parts) == 3:
+                schedule_type = parts[1]
+                schedule_json_str = parts[2]
+                
+                if schedule_type not in ["WEEKDAY", "WEEKEND"]:
+                    response = "ERR: Tipo de horario invalido. Use WEEKDAY o WEEKEND."
+                    return response
+
+                try:
+                    new_schedule = ujson.loads(schedule_json_str)
+                    
+                    # Validar formato: debe ser una lista de listas de 2 elementos
+                    if not isinstance(new_schedule, list) or \
+                       any(not isinstance(t, list) or len(t) != 2 or not all(isinstance(i, int) for i in t) for t in new_schedule):
+                       response = "ERR: Formato JSON de horario invalido. Use [[H, M], [H, M]]."
+                       return response
+                
+                except ValueError:
+                    response = "ERR: JSON invalido en el horario."
+                    return response
+
+                # Aplicar la actualización
+                config_key = f"SCHEDULED_{schedule_type}"
+                new_config = {config_key: new_schedule}
+                
+                if self.config_manager.save_config(new_config):
+                    # Recargar la configuración para que el sistema la use inmediatamente
+                    self.config_manager.load_config()
+                    self.weekday_schedule = self.config['SCHEDULED_WEEKDAY']
+                    self.weekend_schedule = self.config['SCHEDULED_WEEKEND']
+                    response = f"OK: Horario {schedule_type} actualizado y guardado."
+                else:
+                    response = "ERR: Fallo al guardar en config.json."
             
             elif parts[0] == "STATUS":
                 self.notify_status()
@@ -421,7 +472,7 @@ class SystemController:
                 response = "OK: FLOW_TOTAL reset to 0.0"
 
             else:
-                response = "ERR: Comando desconocido"
+                response = "ERR: Comando desconocido o formato incorrecto"
 
         except Exception as e:
             response = f"ERR: Exception {e}"
@@ -456,7 +507,9 @@ class SystemController:
         """Bucle principal que maneja la lógica de tiempo, programación y auto-apagado."""
         last_second = -1
         last_save_time = time.time()
-        last_notify_time = time.time() 
+        last_notify_time = time.time()
+        
+        self.ble_controller.write_param1("Version 1.4")
         
         print("--- Entrando al bucle principal de control ---")
         while True:
@@ -503,14 +556,14 @@ class SystemController:
                             if self.flow_stop_timer_start != 0:
                                 self.flow_stop_timer_start = 0
                                 print("✅ Flujo reestablecido. Reiniciando monitoreo de apagado.")
-                
-                # --- Lógica de Notificación de Estado ---
-                if self.ble_controller.conn_handle is not None:
-                    # Comprueba si han pasado 5 segundos desde la última notificación
-                    if current_timestamp - last_notify_time >= 5:
-                        self.notify_status()
-                        last_notify_time = current_timestamp # Reiniciar el contador
-                        
+                    
+                    # --- Lógica de Notificación de Estado ---
+                    if self.ble_controller.conn_handle is not None:
+                        # Comprueba si han pasado 5 segundos desde la última notificación
+                        if current_timestamp - last_notify_time >= 5:
+                            self.notify_status()
+                            last_notify_time = current_timestamp # Reiniciar el contador
+                            
                 time.sleep(0.01) # Pequeña espera para no monopolizar el ciclo
                 gc.collect()
 
