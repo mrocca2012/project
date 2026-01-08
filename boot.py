@@ -9,7 +9,7 @@ file_version = 1.1
 freq(160000000)
 
 # --- Configuracion de OTA ---
-GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/esp32water/master/"
+GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/esp32water/main/"
 
 def connect_to_wifi():
     """
