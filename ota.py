@@ -1,197 +1,135 @@
-# Modulo OTA Updater para MicroPython
-# Usa conexion HTTPS (segura) con la dependencia 'ussl'.
 import usocket
-import ssl as ussl # <-- Necesario para HTTPS. Asumimos 'import ssl as ussl' esta aplicado si falla.
+import ssl as ussl
 import ujson
 import machine
 import os
-import time
-file_version = 1.1
+import gc
 
 class OTAUpdater:
     def __init__(self, github_url, main_file='main.py'):
-        # Extrae el nombre de host (ej: raw.githubusercontent.com)
-        self.http_host = github_url.replace('https://', '').replace('http://', '').split('/')[0]
-        self.github_url = github_url
+        # Limpieza y formateo de URL y Host
+        self.github_url = github_url if github_url.endswith('/') else github_url + '/'
+        self.http_host = self.github_url.replace('https://', '').replace('http://', '').split('/')[0]
         self.main_file = main_file
-        self.version_url = github_url + 'version.json'
-        self.files_url = github_url + 'files.json'
-        self.http_port = 443 # Puerto por defecto para HTTPS
-        # Paths locales
+        
+        # URLs de control
+        self.version_url = self.github_url + 'version.json'
+        self.files_url = self.github_url + 'files.json'
+        
+        # Paths locales (con barra final para evitar errores de concatenación)
+        self.update_folder = 'update/'
         self.current_version_file = 'version.json'
-        self.temporary_version_file = 'tmp_version.json'
-        self.backup_folder = 'backup'
-        self.update_folder = 'update'
 
-    def _http_get(self, url):
-        """Realiza una solicitud HTTP GET (a traves de SSL) y retorna el contenido."""
+    def _http_get_stream(self, url, dest_path):
+        """Descarga un archivo vía HTTPS y lo escribe directamente en flash."""
+        gc.collect()
         url_path = url.replace(f'https://{self.http_host}', '')
-        addr = usocket.getaddrinfo(self.http_host, self.http_port)[0][-1]
-        s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+        addr = usocket.getaddrinfo(self.http_host, 443)[0][-1]
+        s = usocket.socket()
         
         try:
             s.connect(addr)
-            # Envolver el socket para SSL
             s = ussl.wrap_socket(s, server_hostname=self.http_host)
-            # Solicitud HTTP/1.0
-            request = f"GET {url_path} HTTP/1.0\r\nHost: {self.http_host}\r\nUser-Agent: MicroPython\r\n\r\n".encode()
-            s.send(request)
-            # --- Leer la Respuesta ---
-            # Leemos los primeros 1024 bytes para verificar encabezados
-            data = s.recv(1024)
-            response = data.decode('utf-8', 'ignore')
-            # 1. Verificar el codigo de estado HTTP (Debe ser 200 OK)
-            if not response.startswith('HTTP/1.0 200 OK') and not response.startswith('HTTP/1.1 200 OK'):
-                # Si no es 200 OK, lanzamos un error claro indicando el codigo de estado
-                first_line = response.split('\r\n')[0]
-                raise Exception(f"HTTP Error: {first_line}")
+            # Solicitud HTTP 1.0 para evitar chunked encoding complejo
+            request = f"GET {url_path} HTTP/1.0\r\nHost: {self.http_host}\r\nUser-Agent: MicroPython\r\n\r\n"
+            s.send(request.encode())
 
-            # 2. Encontrar el inicio del cuerpo (despues de la primera linea vacia)
-            content_start = response.find('\r\n\r\n')
-            if content_start == -1:
-                raise Exception("Respuesta incompleta (no se encontró el cuerpo)")
-                
-            content = response[content_start + 4:]
-
-            # 3. Leer el resto del cuerpo
+            # 1. Saltar encabezados buscando la línea vacía (\r\n\r\n)
             while True:
-                data = s.recv(1024)
-                if data:
-                    content += data.decode('utf-8', 'ignore')
-                else:
+                line = s.readline()
+                if not line or line == b'\r\n':
                     break
+            
+            # 2. Escribir el cuerpo directamente al archivo en bloques de 512 bytes
+            with open(dest_path, 'wb') as f:
+                while True:
+                    data = s.recv(512)
+                    if not data:
+                        break
+                    f.write(data)
+            return True
+        except Exception as e:
+            print(f"❌ Error en stream HTTP: {e}")
+            return False
         finally:
             s.close()
+            gc.collect()
+
+    def _get_json_rpc(self, url):
+        """Método auxiliar para leer JSON pequeños (version/files) en RAM."""
+        url_path = url.replace(f'https://{self.http_host}', '')
+        addr = usocket.getaddrinfo(self.http_host, 443)[0][-1]
+        s = usocket.socket()
+        try:
+            s.connect(addr)
+            s = ussl.wrap_socket(s, server_hostname=self.http_host)
+            s.send(f"GET {url_path} HTTP/1.0\r\nHost: {self.http_host}\r\n\r\n".encode())
             
-        return content
-
-    def _get_latest_version(self):
-        """Descarga y parsea el archivo version.json remoto."""
-        try:
-            content = self._http_get(self.version_url)
-            # Aquí es donde el error de sintaxis JSON ocurriría si el contenido fuera HTML/error
-            remote_version = ujson.loads(content)['version']
-            return remote_version
-        except Exception as e:
-            # Ahora este error capturará tanto los errores HTTP (404) como los de JSON.
-            print(f"❌ Error al obtener version remota (Verifique URL/JSON): {e}")
-            return '0.0'
-
-    def _get_current_version(self):
-        """Obtiene la version instalada localmente."""
-        try:
-            with open(self.current_version_file, 'r') as f:
-                local_version = ujson.load(f)['version']
-            return local_version
-        except (OSError, ValueError):
-            # Si el archivo no existe o falla, la version es 0.0
-            return '0.0'
-
-    def _download_file(self, filename):
-        """Descarga un archivo al directorio de actualizacion."""
-        url = self.github_url + filename
-        temp_filepath = self.update_folder + filename
-        print(f"Descargando {filename} a {temp_filepath}...")
-        
-        try:
-            content = self._http_get(url)
-            # Asegurar que la carpeta update exista
-            if 'update' not in os.listdir():
-                os.mkdir('update')
-                
-            with open(temp_filepath, 'w') as f:
-                f.write(content)
-            print(f"✅ Descargado: {filename}")
-        except Exception as e:
-            print(f"❌ Fallo al descargar {filename}: {e}")
-            raise
+            while True:
+                line = s.readline()
+                if not line or line == b'\r\n': break
+            
+            content = s.read().decode('utf-8')
+            return ujson.loads(content)
+        finally:
+            s.close()
 
     def check_for_updates(self):
-        """Compara la version local con la version remota."""
-        latest_version = self._get_latest_version()
-        current_version = self._get_current_version()
-
-        print(f"Version Local: {current_version}, Version Remota: {latest_version}")
-
-        # Comparacion de versiones simple (solo el primer numero)
-        if latest_version > current_version:
-            return True
-        return False
+        """Compara versiones."""
+        try:
+            remote_data = self._get_json_rpc(self.version_url)
+            remote_v = float(remote_data['version'])
+            
+            local_v = 0.0
+            if self.current_version_file in os.listdir():
+                with open(self.current_version_file, 'r') as f:
+                    local_v = float(ujson.load(f)['version'])
+            
+            print(f"OTA: Local {local_v} | Remota {remote_v}")
+            return remote_v > local_v
+        except Exception as e:
+            print(f"OTA: No se pudo verificar versión: {e}")
+            return False
 
     def download_updates(self):
-        """Descarga todos los archivos listados en files.json remotos."""
-        # Eliminar carpeta de actualizacion anterior si existe
+        """Descarga todos los archivos definidos en files.json."""
         try:
-            if 'update' in os.listdir():
-                for file in os.listdir('update'):
-                    os.remove('update' + file)
-                os.rmdir('update')
-        except:
-            pass
+            if 'update' not in os.listdir():
+                os.mkdir('update')
             
-        try:
-            # 1. Obtener la lista de archivos a actualizar
-            files_content = self._http_get(self.files_url)
-            files_to_download = ujson.loads(files_content)['files']
-            # 2. Crear carpeta de actualizacion
-            try:
-                os.mkdir(self.update_folder)
-            except:
-                print("error ")
-
-            # 3. Descargar todos los archivos listados
-            for filename in files_to_download:
-                self._download_file(filename)
-                
-            # 4. Descargar el nuevo version.json a la carpeta de update
-            self._download_file(self.current_version_file)
+            files_data = self._get_json_rpc(self.files_url)
+            for filename in files_data['files']:
+                print(f"📥 Descargando {filename}...")
+                self._http_get_stream(self.github_url + filename, self.update_folder + filename)
             
+            # También descargar el nuevo version.json
+            self._http_get_stream(self.version_url, self.update_folder + self.current_version_file)
+            return True
         except Exception as e:
-            print(f"❌ Fallo critico durante la descarga de archivos: {e}")
-            # Limpiar y levantar error
-            self.clean_update_folder()
-            raise
+            print(f"❌ Error descargando actualización: {e}")
+            return False
 
     def install_updates(self):
-        """Mueve los archivos descargados a la carpeta raiz y reinicia."""
+        """Instala los archivos moviéndolos a la raíz."""
         try:
-            # 1. Mover archivos descargados a la raiz (sobrescribiendo)
-            for file in os.listdir(self.update_folder):
+            for file in os.listdir('update'):
                 source = self.update_folder + file
-                destination = file
+                print(f"🔧 Instalando {file}...")
                 
-                print(f"Instalando: {file}...")
-                
-                # Leemos el contenido, borramos el original, y escribimos en la raiz
-                with open(source, 'r') as s:
-                    content = s.read()
-                
-                # Borramos el archivo en la raiz si existe
+                # Operación de reemplazo segura
                 if file in os.listdir():
                     os.remove(file)
                 
-                # Escribimos el nuevo archivo en la raiz
-                with open(destination, 'w') as d:
-                    d.write(content)
-                
-                os.remove(source) # Eliminar de la carpeta de update
-            
-            self.clean_update_folder()
-            print("✅ Actualización completada. Reiniciando...")
-            machine.reset()
-            
-        except Exception as e:
-            print(f"❌ Error al instalar la actualizacion: {e}")
-            # Si la instalacion falla, la proxima vez intentara actualizar de nuevo
-            self.clean_update_folder()
+                # Leemos y escribimos (en MicroPython os.rename a veces falla entre carpetas)
+                with open(source, 'rb') as src, open(file, 'wb') as dst:
+                    while True:
+                        buf = src.read(512)
+                        if not buf: break
+                        dst.write(buf)
+                os.remove(source)
 
-    def clean_update_folder(self):
-        """Limpia la carpeta 'update'."""
-        try:
-            if 'update' in os.listdir():
-                for file in os.listdir(self.update_folder):
-                    os.remove(self.update_folder + file)
-                os.rmdir(self.update_folder)
-                print("Carpeta 'update' limpia.")
-        except:
-            pass
+            os.rmdir('update')
+            print("✅ Actualización instalada. Reiniciando...")
+            machine.reset()
+        except Exception as e:
+            print(f"❌ Error en instalación: {e}")
