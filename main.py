@@ -12,8 +12,8 @@ TANK_HEIGHT_CM = 200
 VALVE_PIN = 18
 MOTOR_PIN = 19
 FLOW_SENSOR_PIN = 17
-TRIG_PIN = 5
-ECHO_PIN = 21
+TRIG_PIN = 4
+ECHO_PIN = 5
 FLOW_TIMEOUT = 300
 TIMEZONE_OFFSET_HOURS = -4
 current_datetime = (0, 0, 0, 0, 0, 0, 0, 0)
@@ -23,8 +23,8 @@ NTP_SERVERS = ["3.south-america.pool.ntp.org", "pool.ntp.org", "time.google.com"
 class SystemController:
     def __init__(self):
         self.config = self.load_config()
-        self.valve = Pin(VALVE_PIN, Pin.OUT, value=0)
-        self.motor = Pin(MOTOR_PIN, Pin.OUT, value=0)
+        self.valve = Pin(VALVE_PIN, Pin.OUT, value=1)
+        self.motor = Pin(MOTOR_PIN, Pin.OUT, value=1)
         self.trig = Pin(TRIG_PIN, Pin.OUT)
         self.echo = Pin(ECHO_PIN, Pin.IN)
         self.flow_pin = Pin(FLOW_SENSOR_PIN, Pin.IN, Pin.PULL_DOWN)
@@ -34,7 +34,7 @@ class SystemController:
         self.pulses = 0
         self.valve_on = False
         self.motor_on = False
-        self.ip = "192.168.68.12"
+        self.ip = "192.168.68.10"
         self.alert_msg = ""
         self.valve_open_time = 0
         self.time_synced = False
@@ -96,20 +96,20 @@ class SystemController:
         """Regla Mejorada: Exclusión mutua total."""
         if target == 'valve' and action is True:
             if self.motor_on:
-                self.motor.value(0); self.motor_on = False
-            self.valve.value(1); self.valve_on = True
+                self.motor.value(1); self.motor_on = False
+            self.valve.value(0); self.valve_on = True
             self.valve_open_time = time.time()
             self.alert_msg = ""
         elif target == 'motor' and action is True:
             if self.water_level_pct > 10:
                 if self.valve_on:
-                    self.valve.value(0); self.valve_on = False
-                self.motor.value(1); self.motor_on = True
+                    self.valve.value(1); self.valve_on = False
+                self.motor.value(0); self.motor_on = True
             else:
                 self.alert_msg = "ERROR: Nivel bajo para motor."
         elif action is False:
-            if target == 'valve': self.valve.value(0); self.valve_on = False
-            else: self.motor.value(0); self.motor_on = False
+            if target == 'valve': self.valve.value(1); self.valve_on = False
+            else: self.motor.value(1); self.motor_on = False
             
     def check_system(self):
         if not self.time_synced: return
