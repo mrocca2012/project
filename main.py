@@ -20,6 +20,9 @@ current_datetime = (0, 0, 0, 0, 0, 0, 0, 0)
 # Lista de servidores NTP para redundancia
 NTP_SERVERS = ["3.south-america.pool.ntp.org", "pool.ntp.org", "time.google.com"]
 
+#
+# Since there are optocupler value 1 = OFF 0 = ON in valve and motor switch
+#
 class SystemController:
     def __init__(self):
         self.config = self.load_config()
