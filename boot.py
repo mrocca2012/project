@@ -4,9 +4,9 @@ import time
 import gc
 import os
 from machine import freq
-file_version = 1.2
+file_version = 1.1
 
-freq(80000000)
+freq(160000000)
 
 # --- Configuracion de OTA ---
 GITHUB_URL = "https://raw.githubusercontent.com/mrocca2012/project/master/"
@@ -16,7 +16,6 @@ def connect_to_wifi():
     Conecta el ESP32 a la red Wi-Fi probando múltiples credenciales.
     Es ideal para usar en boot.py para actualizaciones OTA.
     """
-    
     # Lista de tuplas: (SSID, PASSWORD) en orden de preferencia
     WIFI_CREDENTIALS = [
         ('WOWIFI', 'fliarorewifi'),
@@ -26,6 +25,7 @@ def connect_to_wifi():
     print("Iniciando conexión Wi-Fi para OTA...")
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    wlan.ifconfig(('192.168.68.12', '255.255.255.0', '192.168.68.1', '192.168.68.1'))
     
     if wlan.isconnected():
         print(f"✅ Wi-Fi ya conectado. IP: {wlan.ifconfig()[0]}")
