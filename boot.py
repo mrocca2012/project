@@ -1,10 +1,16 @@
 # Este script se ejecuta inmediatamente despues del arranque o reset (antes de main.py)
+# programa para el llenado del tanque de agua con
+# horarios programados
+# codigo generado con la ayuda de Google Gemini
+# propiedad de Marco Rocca
+
+version = 1.2
+
 import network
 import time
 import gc
 import os
 from machine import freq
-file_version = 1.1
 
 freq(160000000)
 
@@ -25,7 +31,7 @@ def connect_to_wifi():
     print("Iniciando conexión Wi-Fi para OTA...")
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    wlan.ifconfig(('192.168.68.10', '255.255.255.0', '192.168.68.1', '192.168.68.1'))
+    wlan.ifconfig(('192.168.68.12', '255.255.255.0', '192.168.68.1', '192.168.68.1'))
     
     if wlan.isconnected():
         print(f"✅ Wi-Fi ya conectado. IP: {wlan.ifconfig()[0]}")
