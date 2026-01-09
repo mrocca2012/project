@@ -31,7 +31,7 @@ def connect_to_wifi():
     print("Iniciando conexión Wi-Fi para OTA...")
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    wlan.ifconfig(('192.168.68.12', '255.255.255.0', '192.168.68.1', '192.168.68.1'))
+    wlan.ifconfig(('192.168.68.10', '255.255.255.0', '192.168.68.1', '192.168.68.1'))
     
     if wlan.isconnected():
         print(f"✅ Wi-Fi ya conectado. IP: {wlan.ifconfig()[0]}")
